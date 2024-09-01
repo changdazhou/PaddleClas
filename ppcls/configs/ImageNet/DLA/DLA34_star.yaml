@@ -28,7 +28,7 @@ AMP:
 
 # model architecture
 Arch:
-  name: DLA34
+  name: DLA34_s
   class_num: 1000
 
 # loss function config for traing/eval process

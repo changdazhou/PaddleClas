@@ -19,12 +19,14 @@ import math
 
 import paddle
 import paddle.nn as nn
+from typing import List
 import paddle.nn.functional as F
 
 from paddle.nn.initializer import Normal, Constant
 
 from ..base.theseus_layer import Identity
 from ....utils.save_load import load_dygraph_pretrain
+from ..model_zoo.vision_transformer import trunc_normal_, zeros_, ones_, to_2tuple, DropPath, Identity
 
 MODEL_URLS = {
     "DLA34":
@@ -51,8 +53,112 @@ MODEL_URLS = {
 
 __all__ = MODEL_URLS.keys()
 
-zeros_ = Constant(value=0.)
-ones_ = Constant(value=1.)
+class ConvBN(paddle.nn.Sequential):
+    def __init__(self, in_planes, out_planes, kernel_size=1, stride=1,
+        padding=0, dilation=1, groups=1, with_bn=True):
+        super().__init__()
+        self.add_sublayer(name='conv', sublayer=paddle.nn.Conv2D(
+            in_channels=in_planes, out_channels=out_planes, kernel_size=
+            kernel_size, stride=stride, padding=padding, dilation=dilation,
+            groups=groups))
+        if with_bn:
+            self.add_sublayer(name='bn', sublayer=paddle.nn.BatchNorm2D(
+                num_features=out_planes))
+            init_Constant = paddle.nn.initializer.Constant(value=1)
+            init_Constant(self.bn.weight)
+            init_Constant = paddle.nn.initializer.Constant(value=0)
+            init_Constant(self.bn.bias)
+            
+class Partial_conv3(paddle.nn.Layer):
+    def __init__(self, dim, n_div, forward):
+        super().__init__()
+        self.dim_conv3 = dim // n_div
+        self.dim_untouched = dim - self.dim_conv3
+        self.partial_conv3 = paddle.nn.Conv2D(in_channels=self.dim_conv3,
+            out_channels=self.dim_conv3, kernel_size=3, stride=1, padding=1,
+            bias_attr=False)
+        if forward == 'slicing':
+            self.forward = self.forward_slicing
+        elif forward == 'split_cat':
+            self.forward = self.forward_split_cat
+        else:
+            raise NotImplementedError
+
+    def forward_slicing(self, x: paddle.Tensor) ->paddle.Tensor:
+        x = x.clone()
+        x[:, :self.dim_conv3, :, :] = self.partial_conv3(x[:, :self.
+            dim_conv3, :, :])
+        return x
+
+    def forward_split_cat(self, x: paddle.Tensor) ->paddle.Tensor:
+        x1, x2 = paddle.split(x=x, num_or_sections=[self.dim_conv3,
+            self.dim_untouched], axis=1)
+        x1 = self.partial_conv3(x1)
+        x = paddle.concat(x=(x1, x2), axis=1)
+        return x
+
+class FasterBasic(nn.Layer):
+    def __init__(self, inplanes, planes, stride=1, dilation=1, **cargs):
+        super(FasterBasic, self).__init__()
+        self.conv1 = nn.Conv2D(
+            inplanes,
+            planes,
+            kernel_size=3,
+            stride=stride,
+            padding=dilation,
+            bias_attr=False,
+            dilation=dilation)
+        self.bn1 = nn.BatchNorm2D(planes)
+        self.relu = nn.ReLU()
+        self.conv2 = Partial_conv3(
+            planes,
+            n_div=4,
+            forward='split_cat')
+        self.bn2 = nn.BatchNorm2D(planes)
+        self.stride = stride
+
+    def forward(self, x, residual=None):
+        if residual is None:
+            residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+    
+
+class StarBasic(nn.Layer):
+    def __init__(self, inplanes, planes, stride=1, dilation=1,mlp_ratio=3, drop_path=0.0, **cargs):
+        super(StarBasic, self).__init__()
+        self.dwconv = ConvBN(inplanes, inplanes, 7, 1, (7 - 1) // 2, groups=inplanes,
+            with_bn=True)
+        self.f1 = ConvBN(inplanes, mlp_ratio * inplanes, 1, with_bn=False)
+        self.f2 = ConvBN(inplanes, mlp_ratio * inplanes, 1, with_bn=False)
+        self.g = ConvBN(mlp_ratio * inplanes, inplanes, 1, with_bn=True)
+        self.dwconv2 = ConvBN(inplanes, inplanes, 7, 1, (7 - 1) // 2, groups=inplanes,
+            with_bn=False)
+        self.act = paddle.nn.ReLU6()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else paddle.nn.Identity()
+        self.convbn = ConvBN(inplanes,planes,kernel_size=3,stride=stride,padding=dilation,dilation=dilation,with_bn=True)
+
+    def forward(self, x,residual=None):
+        if residual is None:
+            residual = x
+        input = x
+        x = self.dwconv(x)
+        x1, x2 = self.f1(x), self.f2(x)
+        x = self.act(x1) * x2
+        x = self.dwconv2(self.g(x))
+        x = input + self.drop_path(x)
+        x = self.convbn(x)
+        x = x + residual
+        return x
 
 
 class DlaBasic(nn.Layer):
@@ -94,7 +200,6 @@ class DlaBasic(nn.Layer):
         out = self.relu(out)
 
         return out
-
 
 class DlaBottleneck(nn.Layer):
     expansion = 2
@@ -431,6 +536,22 @@ def DLA34(pretrained=False, **kwargs):
                 block=DlaBasic,
                 **kwargs)
     _load_pretrained(pretrained, model, MODEL_URLS["DLA34"])
+    return model
+
+def DLA34_s(pretrained=False, **kwargs):
+    model = DLA(levels=(1, 1, 1, 2, 2, 1),
+                channels=(16, 32, 64, 128, 256, 512),
+                block=StarBasic,
+                **kwargs)
+    # _load_pretrained(pretrained, model, MODEL_URLS["DLA34"])
+    return model
+
+def DLA34_f(pretrained=False, **kwargs):
+    model = DLA(levels=(1, 1, 1, 2, 2, 1),
+                channels=(16, 32, 64, 128, 256, 512),
+                block=FasterBasic,
+                **kwargs)
+    # _load_pretrained(pretrained, model, MODEL_URLS["DLA34"])
     return model
 
 

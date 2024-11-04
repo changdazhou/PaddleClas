@@ -53,29 +53,49 @@ MODEL_URLS = {
 
 __all__ = MODEL_URLS.keys()
 
+
 class ConvBN(paddle.nn.Sequential):
-    def __init__(self, in_planes, out_planes, kernel_size=1, stride=1,
-        padding=0, dilation=1, groups=1, with_bn=True):
+    def __init__(self,
+                 in_planes,
+                 out_planes,
+                 kernel_size=1,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 groups=1,
+                 with_bn=True):
         super().__init__()
-        self.add_sublayer(name='conv', sublayer=paddle.nn.Conv2D(
-            in_channels=in_planes, out_channels=out_planes, kernel_size=
-            kernel_size, stride=stride, padding=padding, dilation=dilation,
-            groups=groups))
+        self.add_sublayer(
+            name='conv',
+            sublayer=paddle.nn.Conv2D(
+                in_channels=in_planes,
+                out_channels=out_planes,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups))
         if with_bn:
-            self.add_sublayer(name='bn', sublayer=paddle.nn.BatchNorm2D(
-                num_features=out_planes))
+            self.add_sublayer(
+                name='bn',
+                sublayer=paddle.nn.BatchNorm2D(num_features=out_planes))
             init_Constant = paddle.nn.initializer.Constant(value=1)
             init_Constant(self.bn.weight)
             init_Constant = paddle.nn.initializer.Constant(value=0)
             init_Constant(self.bn.bias)
-            
-class Partial_conv3(paddle.nn.Layer):
+
+
+class PartialConv(paddle.nn.Layer):
     def __init__(self, dim, n_div, forward):
         super().__init__()
         self.dim_conv3 = dim // n_div
         self.dim_untouched = dim - self.dim_conv3
-        self.partial_conv3 = paddle.nn.Conv2D(in_channels=self.dim_conv3,
-            out_channels=self.dim_conv3, kernel_size=3, stride=1, padding=1,
+        self.partial_conv3 = paddle.nn.Conv2D(
+            in_channels=self.dim_conv3,
+            out_channels=self.dim_conv3,
+            kernel_size=3,
+            stride=1,
+            padding=1,
             bias_attr=False)
         if forward == 'slicing':
             self.forward = self.forward_slicing
@@ -84,22 +104,31 @@ class Partial_conv3(paddle.nn.Layer):
         else:
             raise NotImplementedError
 
-    def forward_slicing(self, x: paddle.Tensor) ->paddle.Tensor:
+    def forward_slicing(self, x: paddle.Tensor) -> paddle.Tensor:
         x = x.clone()
-        x[:, :self.dim_conv3, :, :] = self.partial_conv3(x[:, :self.
-            dim_conv3, :, :])
+        x[:, :self.dim_conv3, :, :] = self.partial_conv3(
+            x[:, :self.dim_conv3, :, :])
         return x
 
-    def forward_split_cat(self, x: paddle.Tensor) ->paddle.Tensor:
-        x1, x2 = paddle.split(x=x, num_or_sections=[self.dim_conv3,
-            self.dim_untouched], axis=1)
+    def forward_split_cat(self, x: paddle.Tensor) -> paddle.Tensor:
+        x1, x2 = paddle.split(
+            x=x, num_or_sections=[self.dim_conv3, self.dim_untouched], axis=1)
         x1 = self.partial_conv3(x1)
         x = paddle.concat(x=(x1, x2), axis=1)
         return x
 
+
 class FasterBasic(nn.Layer):
-    def __init__(self, inplanes, planes, stride=1, dilation=1, **cargs):
+    def __init__(self,
+                 inplanes,
+                 planes,
+                 stride=1,
+                 dilation=1,
+                 mlp_ratio=2.0,
+                 drop_path=0.0,
+                 **cargs):
         super(FasterBasic, self).__init__()
+        mlp_hidden_dim = int(inplanes * mlp_ratio)
         self.conv1 = nn.Conv2D(
             inplanes,
             planes,
@@ -109,45 +138,76 @@ class FasterBasic(nn.Layer):
             bias_attr=False,
             dilation=dilation)
         self.bn1 = nn.BatchNorm2D(planes)
-        self.relu = nn.ReLU()
-        self.conv2 = Partial_conv3(
-            planes,
-            n_div=4,
-            forward='split_cat')
-        self.bn2 = nn.BatchNorm2D(planes)
-        self.stride = stride
+        self.pconv = PartialConv(planes, n_div=4, forward='split_cat')
+        self.mlp = nn.Sequential(
+            nn.Conv2D(
+                planes, mlp_hidden_dim, kernel_size=1, bias_attr=False),
+            nn.BatchNorm2D(mlp_hidden_dim),
+            nn.ReLU(),
+            nn.Conv2D(
+                mlp_hidden_dim, planes, kernel_size=1, bias_attr=False))
+        self.drop_path = DropPath(
+            drop_path) if drop_path > 0. else paddle.nn.Identity()
 
     def forward(self, x, residual=None):
         if residual is None:
             residual = x
+        # PatchMerging
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu(out)
 
-        out = self.conv2(out)
-        out = self.bn2(out)
-
+        # PConv
+        out = self.pconv(out)
         out += residual
-        out = self.relu(out)
+
+        # Act
+        out = self.drop_path(self.mlp(out))
+
+        # out = self.relu(out)
 
         return out
-    
+
 
 class StarBasic(nn.Layer):
-    def __init__(self, inplanes, planes, stride=1, dilation=1,mlp_ratio=3, drop_path=0.0, **cargs):
+    def __init__(self,
+                 inplanes,
+                 planes,
+                 stride=1,
+                 dilation=1,
+                 mlp_ratio=3,
+                 drop_path=0.0,
+                 **cargs):
         super(StarBasic, self).__init__()
-        self.dwconv = ConvBN(inplanes, inplanes, 7, 1, (7 - 1) // 2, groups=inplanes,
+        self.dwconv = ConvBN(
+            inplanes,
+            inplanes,
+            7,
+            1, (7 - 1) // 2,
+            groups=inplanes,
             with_bn=True)
         self.f1 = ConvBN(inplanes, mlp_ratio * inplanes, 1, with_bn=False)
         self.f2 = ConvBN(inplanes, mlp_ratio * inplanes, 1, with_bn=False)
         self.g = ConvBN(mlp_ratio * inplanes, inplanes, 1, with_bn=True)
-        self.dwconv2 = ConvBN(inplanes, inplanes, 7, 1, (7 - 1) // 2, groups=inplanes,
+        self.dwconv2 = ConvBN(
+            inplanes,
+            inplanes,
+            7,
+            1, (7 - 1) // 2,
+            groups=inplanes,
             with_bn=False)
         self.act = paddle.nn.ReLU6()
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else paddle.nn.Identity()
-        self.convbn = ConvBN(inplanes,planes,kernel_size=3,stride=stride,padding=dilation,dilation=dilation,with_bn=True)
+        self.drop_path = DropPath(
+            drop_path) if drop_path > 0. else paddle.nn.Identity()
+        self.convbn = ConvBN(
+            inplanes,
+            planes,
+            kernel_size=3,
+            stride=stride,
+            padding=dilation,
+            dilation=dilation,
+            with_bn=True)
 
-    def forward(self, x,residual=None):
+    def forward(self, x, residual=None):
         if residual is None:
             residual = x
         input = x
@@ -200,6 +260,7 @@ class DlaBasic(nn.Layer):
         out = self.relu(out)
 
         return out
+
 
 class DlaBottleneck(nn.Layer):
     expansion = 2
@@ -386,6 +447,10 @@ class DLA(nn.Layer):
         self.base_width = base_width
         self.drop_rate = drop_rate
 
+        if not isinstance(block, list):
+            blocks = [block] * 4
+        else:
+            blocks = block
         self.base_layer = nn.Sequential(
             nn.Conv2D(
                 in_chans,
@@ -409,7 +474,7 @@ class DLA(nn.Layer):
 
         self.level2 = DlaTree(
             levels[2],
-            block,
+            blocks[0],
             channels[1],
             channels[2],
             2,
@@ -417,7 +482,7 @@ class DLA(nn.Layer):
             **cargs)
         self.level3 = DlaTree(
             levels[3],
-            block,
+            blocks[1],
             channels[2],
             channels[3],
             2,
@@ -425,7 +490,7 @@ class DLA(nn.Layer):
             **cargs)
         self.level4 = DlaTree(
             levels[4],
-            block,
+            blocks[2],
             channels[3],
             channels[4],
             2,
@@ -433,7 +498,7 @@ class DLA(nn.Layer):
             **cargs)
         self.level5 = DlaTree(
             levels[5],
-            block,
+            blocks[3],
             channels[4],
             channels[5],
             2,
@@ -538,6 +603,7 @@ def DLA34(pretrained=False, **kwargs):
     _load_pretrained(pretrained, model, MODEL_URLS["DLA34"])
     return model
 
+
 def DLA34_s(pretrained=False, **kwargs):
     model = DLA(levels=(1, 1, 1, 2, 2, 1),
                 channels=(16, 32, 64, 128, 256, 512),
@@ -546,10 +612,24 @@ def DLA34_s(pretrained=False, **kwargs):
     # _load_pretrained(pretrained, model, MODEL_URLS["DLA34"])
     return model
 
+
 def DLA34_f(pretrained=False, **kwargs):
     model = DLA(levels=(1, 1, 1, 2, 2, 1),
                 channels=(16, 32, 64, 128, 256, 512),
                 block=FasterBasic,
+                **kwargs)
+    # _load_pretrained(pretrained, model, MODEL_URLS["DLA34"])
+    return model
+
+
+def DLA34_multi(pretrained=False, **kwargs):
+    map_dict = {"f": FasterBasic, "s": StarBasic, "d": DlaBasic}
+    blocks = []
+    for block in list(kwargs.pop('blocks')):
+        blocks.append(map_dict.get(block))
+    model = DLA(levels=(1, 1, 1, 2, 2, 1),
+                channels=(16, 32, 64, 128, 256, 512),
+                block=blocks,
                 **kwargs)
     # _load_pretrained(pretrained, model, MODEL_URLS["DLA34"])
     return model
